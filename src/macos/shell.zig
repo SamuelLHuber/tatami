@@ -40,6 +40,10 @@ const pointer_reach: i32 = 24;
 /// A window that is not a real window yet when it is announced is looked at again.
 const probes_max: u32 = 16;
 const probe_delays_ms = [_]u64{ 150, 500, 1500 };
+/// A window that moved itself and does not say it is in native fullscreen is asked again
+/// after these delays: an application can say so only once its transition is over, after
+/// the last resize that announced it (a browser's video going fullscreen does).
+const fullscreen_probe_delays_ms = [_]u64{ 100, 250, 500, 1000, 2000 };
 const state_debounce_ms: u64 = 2000;
 const config_bytes_max: usize = 64 * 1024;
 /// An application raises a window a moment after it is asked to, which puts the window
@@ -84,6 +88,9 @@ const ShellWindow = struct {
     element: Ref = null,
     /// Moved while a mouse button was down; reported once the button is released.
     dragging: bool = false,
+    /// When to ask again whether it went into native fullscreen, 0 for never.
+    fullscreen_probe_at_ms: u64 = 0,
+    fullscreen_probe_tries: u8 = 0,
 };
 
 /// Events that an effect leads to. They carry no slices, so they can wait in a queue while
@@ -93,6 +100,7 @@ const Followup = union(enum) {
     app_unresponsive: i32,
     window_destroyed: u32,
     focus_reported: u32,
+    fullscreen_entered: u32,
 };
 
 var engine: Engine = undefined;
@@ -202,6 +210,9 @@ fn dispatch(event: Event) void {
             .app_unresponsive => |pid| .{ .app_unresponsive = pid },
             .window_destroyed => |id| .{ .window_destroyed = id },
             .focus_reported => |id| .{ .focus_reported = id },
+            .fullscreen_entered => |id| .{
+                .window_fullscreen = .{ .id = id, .fullscreen = true },
+            },
         });
     }
     dispatching = false;
@@ -383,6 +394,13 @@ fn perform_set_frame(id: u32, pid: i32, frame: Rect) void {
         if (skip and app.hung_batch == batch) return;
         enhanced_off(app);
         if (skip and app.hung_batch == batch) return followup_push(.{ .app_unresponsive = pid });
+    }
+    // A window in native fullscreen that we have not heard of yet is not sent a frame:
+    // that would pull it out of its fullscreen space, or shrink it to a tile inside one.
+    if (window.fullscreen_probe_at_ms != 0 and fullscreen_now(window)) {
+        window.fullscreen_probe_at_ms = 0;
+        followup_push(.{ .fullscreen_entered = id });
+        return;
     }
     const move_only = if (engine.window_find(id)) |known|
         known.actual.w == frame.w and known.actual.h == frame.h
@@ -738,8 +756,50 @@ fn frame_report(window: *ShellWindow, by_user: bool) void {
         if (fullscreen != was) {
             dispatch(.{ .window_fullscreen = .{ .id = id, .fullscreen = fullscreen } });
         }
+        // It moved itself and says it is not in fullscreen: it may not know yet.
+        if (ask and !fullscreen) {
+            window.fullscreen_probe_tries = 0;
+            window.fullscreen_probe_at_ms = c.now_ms() + fullscreen_probe_delays_ms[0];
+        } else {
+            window.fullscreen_probe_at_ms = 0;
+        }
     }
     dispatch(.{ .window_frame_changed = .{ .id = id, .frame = frame, .by_user = by_user } });
+}
+
+/// Whether the window says it is in native fullscreen. An application that does not
+/// answer is taken to be where it was.
+fn fullscreen_now(window: *const ShellWindow) bool {
+    return ax.bool_get_checked(window.element, ax.names.fullscreen) catch false;
+}
+
+/// Asks again the windows that moved themselves lately whether they went into native
+/// fullscreen, until they say so or the delays run out.
+fn fullscreen_probes_run(now: u64) void {
+    for (&windows) |*window| {
+        if (window.id == 0 or window.fullscreen_probe_at_ms == 0) continue;
+        if (window.fullscreen_probe_at_ms > now) continue;
+        const id = window.id;
+        const known = engine.window_find(id) orelse {
+            window.fullscreen_probe_at_ms = 0;
+            continue;
+        };
+        if (known.fullscreen) {
+            window.fullscreen_probe_at_ms = 0;
+            continue;
+        }
+        if (fullscreen_now(window)) {
+            window.fullscreen_probe_at_ms = 0;
+            dispatch(.{ .window_fullscreen = .{ .id = id, .fullscreen = true } });
+            continue;
+        }
+        window.fullscreen_probe_tries += 1;
+        if (window.fullscreen_probe_tries >= fullscreen_probe_delays_ms.len) {
+            window.fullscreen_probe_at_ms = 0;
+            continue;
+        }
+        window.fullscreen_probe_at_ms = now + fullscreen_probe_delays_ms[window.fullscreen_probe_tries];
+    }
 }
 
 fn ax_notify(
@@ -1321,6 +1381,7 @@ fn timer_fired(fired: Ref, info: ?*anyopaque) callconv(.c) void {
         monitors_refresh();
     }
     probes_run(now);
+    fullscreen_probes_run(now);
     if (state_dirty_at_ms != 0 and state_dirty_at_ms <= now) {
         apps_reap();
         state_write();
@@ -1349,6 +1410,10 @@ fn timer_rearm() void {
     }
     for (&probes) |*probe| {
         if (probe.pid != 0 and (next == null or probe.at_ms < next.?)) next = probe.at_ms;
+    }
+    for (&windows) |*window| {
+        const at = window.fullscreen_probe_at_ms;
+        if (window.id != 0 and at != 0 and (next == null or at < next.?)) next = at;
     }
     for (&apps) |*app| {
         if (app.pid == 0 or app.ready or app.retry_at_ms == 0) continue;
