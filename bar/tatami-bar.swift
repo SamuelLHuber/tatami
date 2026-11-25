@@ -131,7 +131,8 @@ struct BarConfig {
 
 // MARK: Drawing
 
-struct Workspace { let index: Int; let focused: Bool; let label: String }
+struct Workspace { let index: Int; let focused: Bool; let visible: Bool; let monitor: Int; let label: String }
+struct Monitor { let index: Int; let x: Int; let y: Int; let w: Int; let h: Int }
 // A menu-bar app shown in the bar: its icon, an optional status dot and text.
 struct TrayItem { let id: String; let icon: NSImage; let dot: NSColor?; let text: String }
 
@@ -605,6 +606,7 @@ final class VolumeSlider: NSView {
 
 struct BarState {
     var workspaces: [Workspace] = []
+    var monitors: [Monitor] = []
     var title = ""
     var status = ""
     var battery = ""
@@ -905,9 +907,10 @@ final class Bar: NSObject, NSApplicationDelegate {
     }
 
     func show(_ n: Int) {
-        var list = state.workspaces.map { Workspace(index: $0.index, focused: $0.index == n, label: $0.label) }
+        var list = state.workspaces.map { Workspace(index: $0.index, focused: $0.index == n, visible: $0.index == n,
+                                                     monitor: $0.monitor, label: $0.label) }
         if !list.contains(where: { $0.index == n }) {
-            list.append(Workspace(index: n, focused: true, label: ""))
+            list.append(Workspace(index: n, focused: true, visible: true, monitor: 0, label: ""))
             list.sort { $0.index < $1.index }
         }
         state.workspaces = list
@@ -915,15 +918,24 @@ final class Bar: NSObject, NSApplicationDelegate {
     }
 
     struct Shown { var title: String; var fullscreen: Bool }
-    struct Snapshot { var workspaces: [Workspace]; var title: String; var fullscreen: Bool; var windows: [Int: Shown] }
+    struct Snapshot { var workspaces: [Workspace]; var monitors: [Monitor]; var title: String; var fullscreen: Bool; var windows: [Int: Shown] }
     var known: [Int: Shown] = [:]
+    var fetchFailures = 0
 
     func fetch() -> Snapshot? {
         guard let ws = json("query workspaces --json")?["workspaces"] as? [[String: Any]] else { return nil }
         let workspaces = ws.map {
             Workspace(index: $0["index"] as? Int ?? 0, focused: $0["focused"] as? Bool ?? false,
+                      visible: $0["visible"] as? Bool ?? false, monitor: $0["monitor"] as? Int ?? 0,
                       label: $0["label"] as? String ?? "")
         }.sorted { $0.index < $1.index }
+        let ms = json("query monitors --json")?["monitors"] as? [[String: Any]] ?? []
+        let monitors = ms.compactMap { m -> Monitor? in
+            guard let f = m["frame"] as? [String: Any] else { return nil }
+            return Monitor(index: m["index"] as? Int ?? 0,
+                           x: f["x"] as? Int ?? 0, y: f["y"] as? Int ?? 0,
+                           w: f["w"] as? Int ?? 0, h: f["h"] as? Int ?? 0)
+        }
         var title = ""
         var fullscreen = false
         var shown: [Int: Shown] = [:]
@@ -935,11 +947,13 @@ final class Bar: NSObject, NSApplicationDelegate {
             if let id = w["id"] as? Int { shown[id] = one }
             if w["focused"] as? Bool ?? false { title = one.title; fullscreen = one.fullscreen }
         }
-        return Snapshot(workspaces: workspaces, title: title, fullscreen: fullscreen, windows: shown)
+        return Snapshot(workspaces: workspaces, monitors: monitors, title: title, fullscreen: fullscreen, windows: shown)
     }
 
     func render(_ snapshot: Snapshot?) {
         guard let s = snapshot else {
+            fetchFailures += 1
+            if fetchFailures < 6 { return }
             state.workspaces = []
             state.title = "tatami is not running"
             fullscreenHidden = false
@@ -947,8 +961,10 @@ final class Bar: NSObject, NSApplicationDelegate {
             render()
             return
         }
+        fetchFailures = 0
         known = s.windows
         state.workspaces = s.workspaces
+        state.monitors = s.monitors
         state.title = s.title
         fullscreenHidden = s.fullscreen
         apply()
